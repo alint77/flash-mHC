@@ -7,11 +7,13 @@ This module is framework-agnostic: pass any ``layer`` that maps
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from itertools import permutations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from . import ops as _ops  # noqa: F401  # ensure custom ops are registered
 
@@ -46,6 +48,7 @@ class MHCLiteBlock(nn.Module):
         hidden_size: int,
         layer: nn.Module,
         triton_fused: bool = True,
+        activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         self.n = n_streams
@@ -53,6 +56,7 @@ class MHCLiteBlock(nn.Module):
         self.nC = n_streams * hidden_size
         self.layer = layer
         self.triton_fused = triton_fused
+        self.activation_checkpointing = activation_checkpointing
 
         n_fact = math.factorial(n_streams)
         self.n_fact = n_fact
@@ -67,7 +71,17 @@ class MHCLiteBlock(nn.Module):
         perm_flat, self.identity_idx = build_permutation_matrices(n_streams)
         self.register_buffer("perm_mat", perm_flat)
 
-    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _use_activation_checkpointing(self, x_streams: torch.Tensor) -> bool:
+        return (
+            self.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+            and x_streams.requires_grad
+        )
+
+    def _mhc_coeffs_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = self.n
         dt = x_streams.dtype
 
@@ -88,13 +102,54 @@ class MHCLiteBlock(nn.Module):
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
 
+    def _mhc_pre_map_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h_pre, h_post, H_merged = self._mhc_coeffs_pytorch(x_streams)
         layer_input = torch.matmul(h_pre.unsqueeze(-2), x_streams).squeeze(-2)
+        return layer_input, H_merged, h_post
+
+    def _mhc_post_res_pytorch(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            torch.matmul(H_merged, x_streams)
+            + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
+        )
+
+    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        use_ckpt = self._use_activation_checkpointing(x_streams)
+        if use_ckpt:
+            layer_input, H_merged, h_post = _checkpoint(
+                lambda x_: self._mhc_pre_map_pytorch(x_),
+                x_streams,
+                use_reentrant=False,
+            )
+        else:
+            layer_input, H_merged, h_post = self._mhc_pre_map_pytorch(x_streams)
+
         layer_output = self.layer(layer_input, **kwargs)
 
-        return torch.matmul(H_merged, x_streams) + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
+        if use_ckpt:
+            return _checkpoint(
+                lambda x_, lo_, H_, hp_: self._mhc_post_res_pytorch(x_, lo_, H_, hp_),
+                x_streams,
+                layer_output,
+                H_merged,
+                h_post,
+                use_reentrant=False,
+            )
+        return self._mhc_post_res_pytorch(x_streams, layer_output, H_merged, h_post)
 
-    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+    def _mhc_coeffs_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = self.n
         dt = x_streams.dtype
         T = x_streams.shape[0]
@@ -112,13 +167,56 @@ class MHCLiteBlock(nn.Module):
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
 
+    def _mhc_pre_map_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h_pre, h_post, H_merged = self._mhc_coeffs_triton(x_streams)
         layer_input = torch.ops.flash_mhc.fused_pre_map(x_streams, h_pre.float())
-        layer_output = self.layer(layer_input, **kwargs)
+        return layer_input, H_merged.float(), h_post.float()
 
+    def _mhc_post_res_triton(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
         return torch.ops.flash_mhc.fused_post_res(
-            x_streams, layer_output, H_merged.float(), h_post.float()
+            x_streams, layer_output, H_merged, h_post
         )
+
+    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        use_ckpt = self._use_activation_checkpointing(x_streams)
+        autotune_ctx = (
+            nullcontext()
+            if self.training
+            else _ops.disable_autotune_temporarily()
+        )
+
+        with autotune_ctx:
+            if use_ckpt:
+                layer_input, H_merged, h_post = _checkpoint(
+                    lambda x_: self._mhc_pre_map_triton(x_),
+                    x_streams,
+                    use_reentrant=False,
+                )
+            else:
+                layer_input, H_merged, h_post = self._mhc_pre_map_triton(x_streams)
+
+            layer_output = self.layer(layer_input, **kwargs)
+
+            if use_ckpt:
+                return _checkpoint(
+                    lambda x_, lo_, H_, hp_: self._mhc_post_res_triton(x_, lo_, H_, hp_),
+                    x_streams,
+                    layer_output,
+                    H_merged,
+                    h_post,
+                    use_reentrant=False,
+                )
+            return self._mhc_post_res_triton(x_streams, layer_output, H_merged, h_post)
 
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         use_triton = (

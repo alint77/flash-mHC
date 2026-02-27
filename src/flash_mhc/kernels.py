@@ -40,6 +40,94 @@ def _get_hw_config():
     return _HW_CONFIG
 
 
+def _autotune_configs_block_k(
+    *,
+    block_ts: tuple[int, ...],
+    block_ks: tuple[int, ...],
+    warps: tuple[int, ...],
+    stages: tuple[int, ...],
+    max_configs: int = 32,
+) -> list[triton.Config]:
+    cfgs = [
+        triton.Config(
+            {"BLOCK_T": bt, "BLOCK_K": bk},
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for bt in block_ts
+        for bk in block_ks
+        for nw in warps
+        for ns in stages
+    ]
+    return cfgs[:max_configs]
+
+
+def _autotune_configs_block_c(
+    *,
+    block_ts: tuple[int, ...],
+    block_cs: tuple[int, ...],
+    warps: tuple[int, ...],
+    stages: tuple[int, ...],
+    max_configs: int = 32,
+) -> list[triton.Config]:
+    cfgs = [
+        triton.Config(
+            {"BLOCK_T": bt, "BLOCK_C": bc},
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for bt in block_ts
+        for bc in block_cs
+        for nw in warps
+        for ns in stages
+    ]
+    return cfgs[:max_configs]
+
+
+_AUTOTUNE_K1_FWD_CONFIGS = _autotune_configs_block_k(
+    block_ts=(64, 128),
+    block_ks=(32, 64, 128, 256),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+_AUTOTUNE_K1_BWD_DX_CONFIGS = _autotune_configs_block_k(
+    block_ts=(64, 128),
+    block_ks=(32, 64, 128, 256),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+_AUTOTUNE_K3_FWD_CONFIGS = _autotune_configs_block_c(
+    block_ts=(32, 64, 128, 256),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+_AUTOTUNE_K3_BWD_DX_CONFIGS = _autotune_configs_block_c(
+    block_ts=(32, 64, 128, 256),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+_AUTOTUNE_K3_BWD_HPRE_CONFIGS = _autotune_configs_block_c(
+    block_ts=(32, 64, 128, 256),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 4),
+)
+_AUTOTUNE_K4_FWD_CONFIGS = _autotune_configs_block_c(
+    block_ts=(16, 32, 64, 128),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 4),
+)
+_AUTOTUNE_K4_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
+    block_ts=(16, 32, 64),
+    block_cs=(64, 128, 256),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Kernel 1: fused_rmsnorm_project
 #
@@ -637,3 +725,166 @@ def _fused_pre_map_bwd_hpre_kernel(
         tl.store(grad_hp_ptr + t_offs * n + 1, ghp1, mask=t_mask)
         tl.store(grad_hp_ptr + t_offs * n + 2, ghp2, mask=t_mask)
         tl.store(grad_hp_ptr + t_offs * n + 3, ghp3, mask=t_mask)
+
+
+# Autotuned launch wrappers used by ops.py runtime path.
+# The search space for each kernel is capped to at most 32 configs.
+
+@triton.autotune(configs=_AUTOTUNE_K1_FWD_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
+@triton.jit
+def _fused_rmsnorm_project_fwd_kernel_autotuned(
+    x_ptr, W_ptr,
+    out_ptr, inv_rms_ptr,
+    T, nC: tl.constexpr, D_out: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    _fused_rmsnorm_project_fwd_kernel(
+        x_ptr,
+        W_ptr,
+        out_ptr,
+        inv_rms_ptr,
+        T,
+        nC,
+        D_out,
+        BLOCK_T,
+        BLOCK_K,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K1_BWD_DX_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
+@triton.jit
+def _fused_rmsnorm_project_bwd_dx_kernel_autotuned(
+    x_ptr, W_ptr, grad_out_ptr, proj_out_ptr, inv_rms_ptr,
+    grad_x_ptr,
+    T, nC: tl.constexpr, D_out: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    _fused_rmsnorm_project_bwd_dx_kernel(
+        x_ptr,
+        W_ptr,
+        grad_out_ptr,
+        proj_out_ptr,
+        inv_rms_ptr,
+        grad_x_ptr,
+        T,
+        nC,
+        D_out,
+        BLOCK_T,
+        BLOCK_K,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K3_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.jit
+def _fused_pre_map_fwd_kernel_autotuned(
+    x_ptr, h_pre_ptr, out_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    _fused_pre_map_fwd_kernel(
+        x_ptr,
+        h_pre_ptr,
+        out_ptr,
+        T,
+        C,
+        n,
+        BLOCK_T,
+        BLOCK_C,
+        NUM_SMS,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K3_BWD_DX_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.jit
+def _fused_pre_map_bwd_dx_kernel_autotuned(
+    h_pre_ptr, grad_out_ptr,
+    grad_x_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    _fused_pre_map_bwd_dx_kernel(
+        h_pre_ptr,
+        grad_out_ptr,
+        grad_x_ptr,
+        T,
+        C,
+        n,
+        BLOCK_T,
+        BLOCK_C,
+        NUM_SMS,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K3_BWD_HPRE_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.jit
+def _fused_pre_map_bwd_hpre_kernel_autotuned(
+    x_ptr, grad_out_ptr,
+    grad_hp_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    _fused_pre_map_bwd_hpre_kernel(
+        x_ptr,
+        grad_out_ptr,
+        grad_hp_ptr,
+        T,
+        C,
+        n,
+        BLOCK_T,
+        BLOCK_C,
+        NUM_SMS,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K4_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.jit
+def _fused_post_res_fwd_kernel_n4_autotuned(
+    x_ptr, lo_ptr, H_ptr, hp_ptr, out_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    _fused_post_res_fwd_kernel_n4(
+        x_ptr,
+        lo_ptr,
+        H_ptr,
+        hp_ptr,
+        out_ptr,
+        T,
+        C,
+        n,
+        BLOCK_T,
+        BLOCK_C,
+        NUM_SMS,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_K4_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.jit
+def _fused_post_res_bwd_fused_kernel_n4_autotuned(
+    x_ptr, lo_ptr, H_ptr, hp_ptr, grad_out_ptr,
+    grad_x_ptr, grad_lo_ptr, grad_H_ptr, grad_hp_ptr,
+    T, C: tl.constexpr, n: tl.constexpr,
+    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    _fused_post_res_bwd_fused_kernel_n4(
+        x_ptr,
+        lo_ptr,
+        H_ptr,
+        hp_ptr,
+        grad_out_ptr,
+        grad_x_ptr,
+        grad_lo_ptr,
+        grad_H_ptr,
+        grad_hp_ptr,
+        T,
+        C,
+        n,
+        BLOCK_T,
+        BLOCK_C,
+        NUM_SMS,
+    )

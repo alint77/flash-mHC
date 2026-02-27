@@ -14,6 +14,8 @@ It provides:
 - Current fused kernels are specialized for `n_streams=4`.
 - Triton path is used for CUDA + bf16 inputs with shape `(T, n, C)`.
 - Fallback path remains pure PyTorch in `MHCLiteBlock`.
+- Runtime Triton autotune is enabled by default for K1/K3/K4 kernels (capped config sets + Triton disk cache).
+- `MHCLiteBlock` supports optional activation checkpointing and disables autotune during eval/inference by default.
 
 ## Install
 
@@ -31,7 +33,13 @@ import torch.nn as nn
 from flash_mhc import MHCLiteBlock
 
 layer = nn.Linear(1024, 1024, bias=False).cuda().bfloat16()
-block = MHCLiteBlock(n_streams=4, hidden_size=1024, layer=layer, triton_fused=True).cuda().bfloat16()
+block = MHCLiteBlock(
+    n_streams=4,
+    hidden_size=1024,
+    layer=layer,
+    triton_fused=True,
+    activation_checkpointing=True,
+).cuda().bfloat16()
 
 x = torch.randn(65536, 4, 1024, device="cuda", dtype=torch.bfloat16)
 out = block(x)
@@ -52,6 +60,14 @@ Grid search for launch parameters:
 python scripts/gridsearch.py --T 65536 --C 1024 --n 4 --json-out output/gridsearch_sm120.json
 ```
 
+## Autotune Controls
+
+By default, `flash-mHC` uses Triton's runtime autotune wrappers for fused kernels.
+
+- `FLASH_MHC_TRITON_AUTOTUNE=0`: disable runtime autotune and use legacy hardcoded launch params from `ops.py`.
+- `FLASH_MHC_TRITON_AUTOTUNE_STATUS=0`: silence one-time autotune status logs.
+- `TRITON_CACHE_DIR=/path/to/cache`: override Triton disk cache location (default is Triton's normal cache path).
+
 ## Tests
 
 ```bash
@@ -69,4 +85,3 @@ pytest -q tests/test_correctness.py
 - `docs/ARCHITECTURE.md`: kernel/dataflow details
 - `docs/TUNING_SM120.md`: SM120 tuning summary and selected params
 - `docs/PUBLISHING.md`: packaging and release checklist
-- `docs/LEGACY_FROM_NANOPLM.md`: historical profiling/tuning notes from source repo

@@ -1,5 +1,11 @@
 # SM120 Tuning Summary (RTX 5090)
 
+This document records the tuned launch configs used by the **legacy fallback**
+path in `src/flash_mhc/ops.py` when runtime autotune is disabled.
+
+Default runtime behavior now uses Triton autotune wrappers with disk caching.
+Use `FLASH_MHC_TRITON_AUTOTUNE=0` to force the legacy hardcoded path below.
+
 Shape tuned: `T=65536, C=1024, n=4`
 
 Workflow:

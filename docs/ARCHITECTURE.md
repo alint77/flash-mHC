@@ -33,6 +33,20 @@ Each op has:
 - CUDA implementation
 - custom autograd registration
 
+## Runtime autotune
+
+`src/flash_mhc/kernels.py` includes autotuned wrappers for all active fused kernels:
+- K1 fwd / K1 bwd-dx
+- K3 fwd / K3 bwd-dx / K3 bwd-hpre
+- K4 fwd / K4 bwd-fused
+
+`src/flash_mhc/ops.py` controls runtime dispatch:
+- default: runtime autotune ON (`FLASH_MHC_TRITON_AUTOTUNE=1`)
+- fallback: legacy hardcoded launch path (`FLASH_MHC_TRITON_AUTOTUNE=0`)
+- one-time status logs (`FLASH_MHC_TRITON_AUTOTUNE_STATUS=1`)
+
+For eval/inference, `MHCLiteBlock` temporarily disables autotune to avoid warmup latency.
+
 ## Constraints
 
 - Current kernels are specialized for `n=4`.
