@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging/build artifacts
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Tool/test caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+.env
+.env.*
+.python-version
+
+# Notebook state
+.ipynb_checkpoints/
+
+# Project outputs
+output/
+*.log
+
+# Editor/OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
