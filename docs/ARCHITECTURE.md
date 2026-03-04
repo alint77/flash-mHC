@@ -18,6 +18,9 @@ Given input streams `x_streams` with shape `(T, n, C)`:
 5. K4 (Triton): `fused_post_res`
    - computes `H_merged @ x_streams + h_post * layer_output`
 
+Backward for K3 is a single fused kernel:
+- `_fused_pre_map_bwd_fused_kernel_n4`
+
 Backward for K4 is a single fused kernel:
 - `_fused_post_res_bwd_fused_kernel_n4`
 
@@ -37,7 +40,7 @@ Each op has:
 
 `src/flash_mhc/kernels.py` includes autotuned wrappers for all active fused kernels:
 - K1 fwd / K1 bwd-dx
-- K3 fwd / K3 bwd-dx / K3 bwd-hpre
+- K3 fwd / K3 bwd-fused
 - K4 fwd / K4 bwd-fused
 
 `src/flash_mhc/ops.py` controls runtime dispatch:

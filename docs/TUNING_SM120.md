@@ -19,8 +19,7 @@ Workflow:
 - `k1_fwd`: `BLOCK_T=128`, `BLOCK_K=64`, `warps=4`, `stages=3`
 - `k1_bwd_dx`: `BLOCK_T=64`, `BLOCK_K=128`, `warps=8`, `stages=3`
 - `k3_fwd`: `BLOCK_T=128`, `BLOCK_C=64`, `warps=4`, `stages=2`
-- `k3_bwd_dx`: `BLOCK_T=64`, `BLOCK_C=256`, `warps=4`, `stages=4`
-- `k3_bwd_hpre`: `BLOCK_T=32`, `BLOCK_C=128`, `warps=8`, `stages=4`
+- `k3_bwd_fused`: `BLOCK_T=32`, `BLOCK_C=256`, `warps=8`, `stages=4`
 - `k4_fwd`: `BLOCK_T=32`, `BLOCK_C=128`, `warps=8`, `stages=3`
 - `k4_bwd_fused`: `BLOCK_T=16`, `BLOCK_C=256`, `warps=8`, `stages=4`
 
