@@ -115,10 +115,10 @@ _AUTOTUNE_K4_FWD_CONFIGS = _autotune_configs_block_c(
     stages=(2, 3, 4),
 )
 _AUTOTUNE_K4_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
-    block_ts=(16, 32, 64),
-    block_cs=(64, 128, 256),
+    block_ts=(8, 16, 32),
+    block_cs=(64, 128),
     warps=(4, 8),
-    stages=(2, 3),
+    stages=(2,),
 )
 
 
@@ -158,7 +158,7 @@ def _fused_rmsnorm_project_fwd_kernel(
             block_shape=(BLOCK_T, BLOCK_K),
             order=(1, 0)
         )
-        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1))
+        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_first")
         x_tile_f32 = x_tile.to(tl.float32)
         sum_sq += tl.sum(x_tile_f32 * x_tile_f32, axis=1)
         
@@ -178,13 +178,13 @@ def _fused_rmsnorm_project_fwd_kernel(
         acc += tl.dot(x_tile, w_tile.T)
 
     inv_rms = tl.rsqrt(sum_sq / nC + 1e-6)
-    tl.store(inv_rms_ptr + t_offs, inv_rms, mask=t_mask)
+    tl.store(inv_rms_ptr + t_offs, inv_rms, mask=t_mask, cache_modifier=".cs")
 
     # proj_out = (x @ W_T) / rms = (x @ W_T) * inv_rms
     out_vals = acc * inv_rms[:, None]
 
     out_ptrs = out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
-    tl.store(out_ptrs, out_vals.to(tl.bfloat16), mask=t_mask[:, None])
+    tl.store(out_ptrs, out_vals.to(tl.bfloat16), mask=t_mask[:, None], cache_modifier=".cs")
 
 
 @triton.jit
@@ -207,14 +207,14 @@ def _fused_rmsnorm_project_bwd_dx_kernel(
     t_offs = t_start + tl.arange(0, BLOCK_T)
     t_mask = t_offs < T
 
-    inv_rms = tl.load(inv_rms_ptr + t_offs, mask=t_mask, other=1.0)
+    inv_rms = tl.load(inv_rms_ptr + t_offs, mask=t_mask, other=1.0, eviction_policy="evict_first")
     
     d_offs = tl.arange(0, D_out)
     go_ptrs = grad_out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
     proj_ptrs = proj_out_ptr + t_offs[:, None] * D_out + d_offs[None, :]
     
-    go = tl.load(go_ptrs, mask=t_mask[:, None], other=0.0)
-    proj_out = tl.load(proj_ptrs, mask=t_mask[:, None], other=0.0)
+    go = tl.load(go_ptrs, mask=t_mask[:, None], other=0.0, eviction_policy="evict_first")
+    proj_out = tl.load(proj_ptrs, mask=t_mask[:, None], other=0.0, eviction_policy="evict_first")
 
     # Compute scale directly from outputs without iterating x again.
     # scale = sum_d(go_d * proj_out_d) / (rms^2 * nC) = dot * inv_rms^2 / nC
@@ -231,7 +231,7 @@ def _fused_rmsnorm_project_bwd_dx_kernel(
             block_shape=(BLOCK_T, BLOCK_K),
             order=(1, 0)
         )
-        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+        x_tile = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
         
         # Load W_tile: need (D_out, BLOCK_K)
         w_block_ptr = tl.make_block_ptr(
@@ -257,7 +257,7 @@ def _fused_rmsnorm_project_bwd_dx_kernel(
             block_shape=(BLOCK_T, BLOCK_K),
             order=(1, 0)
         )
-        tl.store(gx_block_ptr, dx_tile.to(tl.bfloat16), boundary_check=(0, 1))
+        tl.store(gx_block_ptr, dx_tile.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Kernel 4: fused_post_res — THE CRITICAL KERNEL
@@ -294,7 +294,7 @@ def _fused_post_res_fwd_kernel_n4(
             block_shape=(BLOCK_T, BLOCK_C),
             order=(1, 0),
         )
-        lo = tl.load(lo_ptrs, boundary_check=(0, 1)).to(tl.float32)
+        lo = tl.load(lo_ptrs, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
 
         hp0 = tl.load(hp_ptr + t_offs * n + 0, mask=t_mask, other=0.0).to(tl.float32)
         hp1 = tl.load(hp_ptr + t_offs * n + 1, mask=t_mask, other=0.0).to(tl.float32)
@@ -315,7 +315,7 @@ def _fused_post_res_fwd_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            xj = tl.load(x_ptrs, boundary_check=(0, 1)).to(tl.float32)
+            xj = tl.load(x_ptrs, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
 
             h0j = tl.load(H_ptr + t_offs * (n * n) + 0 * n + j, mask=t_mask, other=0.0).to(tl.float32)
             h1j = tl.load(H_ptr + t_offs * (n * n) + 1 * n + j, mask=t_mask, other=0.0).to(tl.float32)
@@ -359,10 +359,10 @@ def _fused_post_res_fwd_kernel_n4(
             block_shape=(BLOCK_T, BLOCK_C),
             order=(1, 0),
         )
-        tl.store(out0, acc0.to(tl.bfloat16), boundary_check=(0, 1))
-        tl.store(out1, acc1.to(tl.bfloat16), boundary_check=(0, 1))
-        tl.store(out2, acc2.to(tl.bfloat16), boundary_check=(0, 1))
-        tl.store(out3, acc3.to(tl.bfloat16), boundary_check=(0, 1))
+        tl.store(out0, acc0.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+        tl.store(out1, acc1.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+        tl.store(out2, acc2.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+        tl.store(out3, acc3.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
 
 # ---------- K4 Backward: Fused kernel (grad_x, grad_lo, grad_H, grad_hp) ----------
@@ -388,6 +388,14 @@ def _fused_post_res_bwd_fused_kernel_n4(
       Phase 2b: Load lo, accumulate ghp, release lo
       Phase 3 (per j): Load x_j, accumulate gH_ij, compute+store grad_x_j, release x_j
     Max live 2D tiles: 5 (4 go + 1 streaming x/lo)
+
+    Cache policy optimization:
+      - All stores use cache_modifier='.cs' (streaming) to bypass L2 write-allocate,
+        eliminating ~1.2 GB of DRAM write amplification from read-modify-write of
+        cache lines that are never read again.
+      - Read-once loads (x_streams, layer_output) use eviction_policy='evict_first'
+        to reduce L2 pollution, preserving cache for grad_out which is reused
+        across all phases within each C-tile.
     """
     tl.static_assert(n == 4)
     pid = tl.program_id(0)
@@ -459,11 +467,11 @@ def _fused_post_res_bwd_fused_kernel_n4(
             # grad_lo[t, c] = sum_i hp[t, i] * go[t, i, c]  (no reduction over C)
             glo = hp_0[:, None] * go0 + hp_1[:, None] * go1 + hp_2[:, None] * go2 + hp_3[:, None] * go3
             glo_ptr = tl.make_block_ptr(base=grad_lo_ptr, shape=(T, C), strides=(C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            tl.store(glo_ptr, glo.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(glo_ptr, glo.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
             # --- Phase 2b: load lo, accumulate ghp, release lo ---
             lo_block_ptr = tl.make_block_ptr(base=lo_ptr, shape=(T, C), strides=(C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            lo = tl.load(lo_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+            lo = tl.load(lo_block_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             ghp_0 += tl.sum(go0 * lo, axis=1)
             ghp_1 += tl.sum(go1 * lo, axis=1)
             ghp_2 += tl.sum(go2 * lo, axis=1)
@@ -472,7 +480,7 @@ def _fused_post_res_bwd_fused_kernel_n4(
             # --- Phase 3: stream x_j one at a time, accumulate gH + compute+store grad_x_j ---
             # x stream 0
             x0_ptr = tl.make_block_ptr(base=x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             gH_00 += tl.sum(go0 * x0, axis=1)
             gH_10 += tl.sum(go1 * x0, axis=1)
             gH_20 += tl.sum(go2 * x0, axis=1)
@@ -480,64 +488,65 @@ def _fused_post_res_bwd_fused_kernel_n4(
             # grad_x[t, 0, c] = sum_i H[t, i, 0] * go[t, i, c]
             gx0 = H_00[:, None] * go0 + H_10[:, None] * go1 + H_20[:, None] * go2 + H_30[:, None] * go3
             gx0_ptr = tl.make_block_ptr(base=grad_x_ptr + 0 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
             # x stream 1
             x1_ptr = tl.make_block_ptr(base=x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             gH_01 += tl.sum(go0 * x1, axis=1)
             gH_11 += tl.sum(go1 * x1, axis=1)
             gH_21 += tl.sum(go2 * x1, axis=1)
             gH_31 += tl.sum(go3 * x1, axis=1)
             gx1 = H_01[:, None] * go0 + H_11[:, None] * go1 + H_21[:, None] * go2 + H_31[:, None] * go3
             gx1_ptr = tl.make_block_ptr(base=grad_x_ptr + 1 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
             # x stream 2
             x2_ptr = tl.make_block_ptr(base=x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             gH_02 += tl.sum(go0 * x2, axis=1)
             gH_12 += tl.sum(go1 * x2, axis=1)
             gH_22 += tl.sum(go2 * x2, axis=1)
             gH_32 += tl.sum(go3 * x2, axis=1)
             gx2 = H_02[:, None] * go0 + H_12[:, None] * go1 + H_22[:, None] * go2 + H_32[:, None] * go3
             gx2_ptr = tl.make_block_ptr(base=grad_x_ptr + 2 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
             # x stream 3
             x3_ptr = tl.make_block_ptr(base=x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x3 = tl.load(x3_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             gH_03 += tl.sum(go0 * x3, axis=1)
             gH_13 += tl.sum(go1 * x3, axis=1)
             gH_23 += tl.sum(go2 * x3, axis=1)
             gH_33 += tl.sum(go3 * x3, axis=1)
             gx3 = H_03[:, None] * go0 + H_13[:, None] * go1 + H_23[:, None] * go2 + H_33[:, None] * go3
             gx3_ptr = tl.make_block_ptr(base=grad_x_ptr + 3 * C, shape=(T, C), strides=(n * C, 1), offsets=(tile_id * BLOCK_T, c_start), block_shape=(BLOCK_T, BLOCK_C), order=(1, 0))
-            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
         # Store reduction outputs: grad_hp[t, i] and grad_H[t, i, j]
-        tl.store(grad_hp_ptr + t_offs * n + 0, ghp_0, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 1, ghp_1, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 2, ghp_2, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 3, ghp_3, mask=t_mask)
+        # All outputs are write-once → use streaming stores to bypass L2 write-allocate.
+        tl.store(grad_hp_ptr + t_offs * n + 0, ghp_0, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 1, ghp_1, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 2, ghp_2, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 3, ghp_3, mask=t_mask, cache_modifier=".cs")
 
         H_base = t_offs * (n * n)
-        tl.store(grad_H_ptr + H_base + 0,  gH_00, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 1,  gH_01, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 2,  gH_02, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 3,  gH_03, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 4,  gH_10, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 5,  gH_11, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 6,  gH_12, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 7,  gH_13, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 8,  gH_20, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 9,  gH_21, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 10, gH_22, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 11, gH_23, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 12, gH_30, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 13, gH_31, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 14, gH_32, mask=t_mask)
-        tl.store(grad_H_ptr + H_base + 15, gH_33, mask=t_mask)
+        tl.store(grad_H_ptr + H_base + 0,  gH_00, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 1,  gH_01, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 2,  gH_02, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 3,  gH_03, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 4,  gH_10, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 5,  gH_11, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 6,  gH_12, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 7,  gH_13, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 8,  gH_20, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 9,  gH_21, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 10, gH_22, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 11, gH_23, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 12, gH_30, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 13, gH_31, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 14, gH_32, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_H_ptr + H_base + 15, gH_33, mask=t_mask, cache_modifier=".cs")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -578,7 +587,7 @@ def _fused_pre_map_fwd_kernel(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0)
             )
-            x_j = tl.load(x_block_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x_j = tl.load(x_block_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             acc += hp_j[:, None] * x_j
 
         out_block_ptr = tl.make_block_ptr(
@@ -589,7 +598,7 @@ def _fused_pre_map_fwd_kernel(
             block_shape=(BLOCK_T, BLOCK_C),
             order=(1, 0)
         )
-        tl.store(out_block_ptr, acc.to(tl.bfloat16), boundary_check=(0, 1))
+        tl.store(out_block_ptr, acc.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
 
 @triton.jit
@@ -634,7 +643,7 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            go = tl.load(go_ptr, boundary_check=(0, 1)).to(tl.float32)
+            go = tl.load(go_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
 
             gx0 = hp0[:, None] * go
             gx1 = hp1[:, None] * go
@@ -673,10 +682,10 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1))
-            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1))
-            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1))
-            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
+            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1), cache_modifier=".cs")
 
             x0_ptr = tl.make_block_ptr(
                 base=x_ptr + 0 * C,
@@ -686,7 +695,7 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             ghp0 += tl.sum(x0 * go, axis=1)
 
             x1_ptr = tl.make_block_ptr(
@@ -697,7 +706,7 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             ghp1 += tl.sum(x1 * go, axis=1)
 
             x2_ptr = tl.make_block_ptr(
@@ -708,7 +717,7 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             ghp2 += tl.sum(x2 * go, axis=1)
 
             x3_ptr = tl.make_block_ptr(
@@ -719,13 +728,13 @@ def _fused_pre_map_bwd_fused_kernel_n4(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-            x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
+            x3 = tl.load(x3_ptr, boundary_check=(0, 1), eviction_policy="evict_first").to(tl.float32)
             ghp3 += tl.sum(x3 * go, axis=1)
 
-        tl.store(grad_hp_ptr + t_offs * n + 0, ghp0, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 1, ghp1, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 2, ghp2, mask=t_mask)
-        tl.store(grad_hp_ptr + t_offs * n + 3, ghp3, mask=t_mask)
+        tl.store(grad_hp_ptr + t_offs * n + 0, ghp0, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 1, ghp1, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 2, ghp2, mask=t_mask, cache_modifier=".cs")
+        tl.store(grad_hp_ptr + t_offs * n + 3, ghp3, mask=t_mask, cache_modifier=".cs")
 
 
 # Autotuned launch wrappers used by ops.py runtime path.

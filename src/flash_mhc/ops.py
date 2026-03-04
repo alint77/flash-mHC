@@ -628,10 +628,11 @@ def _fused_post_res_backward_cuda(
     else:
         cc_major, _ = torch.cuda.get_device_capability()
         if cc_major >= 12:
-            # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
+            # Tuned on RTX PRO 6000 (SM120), T=65536/C=2560/n=4.
+            # BC=256 hits 255 regs → 1 block/SM; BC=128+nw=4 → 118 regs, 82% peak BW.
             BLOCK_T_F = 16
-            BLOCK_C_F = 256
-            nw_fused = 8
+            BLOCK_C_F = 128
+            nw_fused = 4
             ns_fused = 2
         elif cc_major == 9:
             BLOCK_T_F = 32
