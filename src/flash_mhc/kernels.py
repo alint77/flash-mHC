@@ -7,16 +7,115 @@ K2 (coefficient computation) stays in PyTorch since it operates on only
 Design follows the same persistent-scheduling pattern as triton_kernels.py.
 
 K4 backward uses a single fused kernel; split backward kernels were removed.
+
+Autotune logging is enabled by default. Set the environment variable
+FLASH_MHC_AUTOTUNE_LOG=0 to silence it.
 """
+
+import functools
+import os
+import time as _time
 
 import torch
 import triton
 import triton.language as tl
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Autotune logging
+# ═══════════════════════════════════════════════════════════════════════════
+_AUTOTUNE_LOG = os.environ.get("FLASH_MHC_AUTOTUNE_LOG", "1") not in ("0", "false", "False", "no")
+
+
+def _logged_autotune(*, configs, key, **kwargs):
+    """Drop-in replacement for ``triton.autotune`` that logs progress.
+
+    When *FLASH_MHC_AUTOTUNE_LOG* is enabled (default) this prints:
+    * when autotuning **starts** (kernel name + number of configs),
+    * when autotuning **finishes** (best config + wall-clock time), and
+    * when a cached result is **loaded from disk** instead of re-running.
+
+    The wrapper is transparent: it returns the same ``Autotuner`` object that
+    ``triton.autotune`` would, so the kernel can be invoked identically.
+    """
+    def decorator(fn):
+        # Build the real Triton autotuner.
+        autotuned = triton.autotune(configs=configs, key=key, **kwargs)(fn)
+
+        if not _AUTOTUNE_LOG:
+            return autotuned
+
+        kernel_name = fn.__name__
+        n_configs = len(configs)
+
+        # Patch the ``run`` method so we can inject logging around the
+        # autotuner's first-invocation search **and** cache loads.
+        _original_run = autotuned.run
+
+        @functools.wraps(_original_run)
+        def _logged_run(*args, **kw):
+            # Build the same cache key Triton uses internally.
+            nargs = dict(zip(autotuned.arg_names, args))
+            all_args = {**nargs, **kw}
+            _args = {k: v for k, v in all_args.items() if k in autotuned.arg_names}
+            cache_key = tuple(
+                [_args[k] for k in autotuned.keys if k in _args]
+                + [str(v.dtype) for v in _args.values() if hasattr(v, "dtype")]
+            )
+            already_cached = cache_key in autotuned.cache
+
+            if already_cached:
+                return _original_run(*args, **kw)
+
+            # Not in memory cache — this call will either autotune or read
+            # from disk.  Record state *before* the call so we can detect
+            # which path was taken.
+            had_disk_hit = [False]
+            _original_check = autotuned.check_disk_cache
+
+            def _patched_check(tkey, cfgs, bench_fn):
+                result = _original_check(tkey, cfgs, bench_fn)
+                had_disk_hit[0] = result
+                return result
+
+            autotuned.check_disk_cache = _patched_check
+            t0 = _time.perf_counter()
+
+            try:
+                print(
+                    f"[flash-mHC] ⏳ Autotuning {kernel_name} "
+                    f"({n_configs} configs, key={cache_key}) …"
+                )
+                ret = _original_run(*args, **kw)
+            finally:
+                autotuned.check_disk_cache = _original_check
+
+            elapsed = _time.perf_counter() - t0
+            best = autotuned.best_config
+
+            if had_disk_hit[0]:
+                print(
+                    f"[flash-mHC] ✅ {kernel_name}: loaded from autotune cache "
+                    f"→ {best}  ({elapsed:.2f}s)"
+                )
+            else:
+                print(
+                    f"[flash-mHC] ✅ {kernel_name}: best config "
+                    f"→ {best}  (tuned {n_configs} configs in {elapsed:.2f}s)"
+                )
+
+            return ret
+
+        autotuned.run = _logged_run
+        return autotuned
+
+    return decorator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Hardware detection (shared with triton_kernels.py)
 # ═══════════════════════════════════════════════════════════════════════════
 _HW_CONFIG = None
+
 
 def _get_hw_config():
     global _HW_CONFIG
@@ -24,20 +123,25 @@ def _get_hw_config():
         props = torch.cuda.get_device_properties("cuda")
         num_sms = props.multi_processor_count
         cc = (props.major, props.minor)
-        
+
         # SM90 (Hopper) has 227KB shared memory per block
         if cc == (9, 0):
             # (num_sms, num_warps, num_stages)
             _HW_CONFIG = (num_sms, 8, 4)
         elif cc[0] >= 12 or cc == (8, 9):
-            # SM120 (Blackwell consumer/workstation: RTX 5090, RTX 6000 Blackwell) 
+            # SM120 (Blackwell consumer/workstation: RTX 5090, RTX 6000 Blackwell)
             # and SM89 (Ada Lovelace) have strict ~99-100KB shared memory limits per block.
             _HW_CONFIG = (num_sms, 4, 2)
         else:
             # Safe default for older/untested architectures
             _HW_CONFIG = (num_sms, 4, 2)
-            
+
     return _HW_CONFIG
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Autotune config generation
+# ═══════════════════════════════════════════════════════════════════════════
 
 
 def _autotune_configs_block_k(
@@ -46,7 +150,7 @@ def _autotune_configs_block_k(
     block_ks: tuple[int, ...],
     warps: tuple[int, ...],
     stages: tuple[int, ...],
-    max_configs: int = 32,
+    max_configs: int = 64,
 ) -> list[triton.Config]:
     cfgs = [
         triton.Config(
@@ -68,7 +172,7 @@ def _autotune_configs_block_c(
     block_cs: tuple[int, ...],
     warps: tuple[int, ...],
     stages: tuple[int, ...],
-    max_configs: int = 32,
+    max_configs: int = 64,
 ) -> list[triton.Config]:
     cfgs = [
         triton.Config(
@@ -84,41 +188,53 @@ def _autotune_configs_block_c(
     return cfgs[:max_configs]
 
 
+# ---------------------------------------------------------------------------
+# Config grids — cover SM80/SM89/SM90/SM120 and a wide range of T / C values
+# while staying at or under 64 configs per kernel to keep autotune fast.
+# ---------------------------------------------------------------------------
+
+# K1: reduction over nC dim  (BLOCK_K drives tile size along nC)
+# 3 BT × 4 BK × 2 warps × 2 stages = 48 configs
 _AUTOTUNE_K1_FWD_CONFIGS = _autotune_configs_block_k(
-    block_ts=(64, 128),
-    block_ks=(32, 64, 128, 256),
+    block_ts=(64, 128, 256),
+    block_ks=(64, 128, 256),
     warps=(4, 8),
     stages=(2, 3),
 )
+# same search space for backward
 _AUTOTUNE_K1_BWD_DX_CONFIGS = _autotune_configs_block_k(
-    block_ts=(64, 128),
-    block_ks=(32, 64, 128, 256),
+    block_ts=(64, 128, 256),
+    block_ks=(64, 128, 256),
     warps=(4, 8),
     stages=(2, 3),
 )
+# K3 fwd: 4 BT × 3 BC × 2 warps × 2 stages = 48 configs
 _AUTOTUNE_K3_FWD_CONFIGS = _autotune_configs_block_c(
     block_ts=(32, 64, 128, 256),
-    block_cs=(64, 128),
-    warps=(4, 8),
+    block_cs=(64, 128, 256),
+    warps=(8, 16),
     stages=(2, 3),
 )
+# K3 bwd: 3 BT × 3 BC × 2 warps × 2 stages = 36 configs
 _AUTOTUNE_K3_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
     block_ts=(32, 64, 128),
     block_cs=(64, 128, 256),
-    warps=(4, 8),
-    stages=(2, 3, 4),
+    warps=(8, 16),
+    stages=(2, 3),
 )
+# K4 fwd: 4 BT × 3 BC × 2 warps × 2 stages = 48 configs
 _AUTOTUNE_K4_FWD_CONFIGS = _autotune_configs_block_c(
     block_ts=(16, 32, 64, 128),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2, 3, 4),
+    block_cs=(64, 128, 256),
+    warps=(8, 16),
+    stages=(2, 3),
 )
+# K4 bwd: 3 BT × 3 BC × 2 warps × 2 stages = 36 configs
 _AUTOTUNE_K4_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
-    block_ts=(8, 16, 32),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2,),
+    block_ts=(16, 32, 64),
+    block_cs=(64, 128, 256),
+    warps=(8, 16),
+    stages=(2, 3),
 )
 
 
@@ -737,10 +853,18 @@ def _fused_pre_map_bwd_fused_kernel_n4(
         tl.store(grad_hp_ptr + t_offs * n + 3, ghp3, mask=t_mask, cache_modifier=".cs")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Autotuned launch wrappers used by ops.py runtime path.
-# The search space for each kernel is capped to at most 32 configs.
+#
+# Each wrapper delegates to the corresponding bare @triton.jit kernel above.
+# The search space per kernel can reach up to 96 configs; results are cached
+# to disk by Triton so subsequent runs with the same (T, C, n, dtype) key
+# skip the search entirely.
+#
+# Logging is controlled by FLASH_MHC_AUTOTUNE_LOG (default: enabled).
+# ═══════════════════════════════════════════════════════════════════════════
 
-@triton.autotune(configs=_AUTOTUNE_K1_FWD_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K1_FWD_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
 @triton.jit
 def _fused_rmsnorm_project_fwd_kernel_autotuned(
     x_ptr, W_ptr,
@@ -761,7 +885,7 @@ def _fused_rmsnorm_project_fwd_kernel_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K1_BWD_DX_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K1_BWD_DX_CONFIGS, key=["T", "nC", "D_out"], cache_results=True)
 @triton.jit
 def _fused_rmsnorm_project_bwd_dx_kernel_autotuned(
     x_ptr, W_ptr, grad_out_ptr, proj_out_ptr, inv_rms_ptr,
@@ -784,7 +908,7 @@ def _fused_rmsnorm_project_bwd_dx_kernel_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K3_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K3_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
 @triton.jit
 def _fused_pre_map_fwd_kernel_autotuned(
     x_ptr, h_pre_ptr, out_ptr,
@@ -805,7 +929,7 @@ def _fused_pre_map_fwd_kernel_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K3_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K3_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
 @triton.jit
 def _fused_pre_map_bwd_fused_kernel_n4_autotuned(
     x_ptr, h_pre_ptr, grad_out_ptr,
@@ -829,7 +953,7 @@ def _fused_pre_map_bwd_fused_kernel_n4_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K4_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K4_FWD_CONFIGS, key=["T", "C", "n"], cache_results=True)
 @triton.jit
 def _fused_post_res_fwd_kernel_n4_autotuned(
     x_ptr, lo_ptr, H_ptr, hp_ptr, out_ptr,
@@ -852,7 +976,7 @@ def _fused_post_res_fwd_kernel_n4_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K4_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@_logged_autotune(configs=_AUTOTUNE_K4_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
 @triton.jit
 def _fused_post_res_bwd_fused_kernel_n4_autotuned(
     x_ptr, lo_ptr, H_ptr, hp_ptr, grad_out_ptr,
